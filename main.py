@@ -110,6 +110,17 @@ class DownloaderWorker(QtCore.QThread):
         self._is_paused = False
         self._lock = QtCore.QMutex()
         self.active = True
+        
+        # Optimization: Persistent session with connection pooling
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=20,  # Allow up to 20 connection pools
+            pool_maxsize=20,      # Allow up to 20 connections per pool
+            max_retries=3         # Automatic retries
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        self.session.headers.update(HEADERS)
 
     def pause(self):
         with QtCore.QMutexLocker(self._lock):
@@ -125,6 +136,7 @@ class DownloaderWorker(QtCore.QThread):
 
     def stop(self):
         self.active = False
+        self.session.close() # Close session
         self.terminate()
 
     def run(self):
@@ -176,14 +188,17 @@ class DownloaderWorker(QtCore.QThread):
 
     def get_remote_size(self, url):
         """Get file size in megabytes"""
-        head = requests.head(url, headers=HEADERS, timeout=10)
-        size_bytes = int(head.headers.get('content-length', 0))
-        return size_bytes / (1024 * 1024)
+        try:
+            head = self.session.head(url, timeout=10)
+            size_bytes = int(head.headers.get('content-length', 0))
+            return size_bytes / (1024 * 1024)
+        except:
+            return 0.0
 
     def download_file(self, url, path):
         """Download dispatcher with enhanced speed tracking"""
         try:
-            head = requests.head(url, headers=HEADERS, timeout=10)
+            head = self.session.head(url, timeout=10)
             total_size = int(head.headers.get('content-length', 0))
             accept_ranges = 'bytes' in head.headers.get('Accept-Ranges', '')
 
@@ -209,7 +224,8 @@ class DownloaderWorker(QtCore.QThread):
         with open(path, 'wb') as f:
             f.truncate(total_size)
 
-        with ThreadPoolExecutor(max_workers=6) as executor:
+        # Optimization: Increased workers from 6 to 16
+        with ThreadPoolExecutor(max_workers=16) as executor:
             futures = [executor.submit(
                 self.download_chunk,
                 url, start, min(start+chunk_size-1, total_size-1), path, i+1, len(chunks)
@@ -222,8 +238,8 @@ class DownloaderWorker(QtCore.QThread):
                     break
                 
                 try:
-                    chunk_size = future.result()
-                    downloaded += chunk_size
+                    chunk_size_dl = future.result()
+                    downloaded += chunk_size_dl
                     self.update_speed_metrics(downloaded, total_size)
                     
                 except Exception as e:
@@ -268,20 +284,19 @@ class DownloaderWorker(QtCore.QThread):
 
     def download_chunk(self, url, start, end, path, chunk_num, total_chunks):
         """Chunk downloader with detailed logging"""
-        self.log_signal.emit(
-            f"🔽 Starting chunk {chunk_num}/{total_chunks}\n"
-            f"   Range: {start}-{end} bytes"
-        )
+        # Reduced logging noise for better performance
+        # self.log_signal.emit(f"🔽 Starting chunk {chunk_num}/{total_chunks}")
         
         for attempt in range(3):
             try:
                 if self.should_pause():
                     self.wait_while_paused()
 
-                headers = HEADERS.copy()
-                headers['Range'] = f'bytes={start}-{end}'
+                # Optimization: Use self.session instead of requests.get
+                headers = {'Range': f'bytes={start}-{end}'} 
+                # Note: Session headers (like User-Agent) are already included
                 
-                response = requests.get(url, headers=headers, stream=True, timeout=15)
+                response = self.session.get(url, headers=headers, stream=True, timeout=15)
                 response.raise_for_status()
                 
                 chunk_data = bytearray()
@@ -297,29 +312,21 @@ class DownloaderWorker(QtCore.QThread):
                     f.seek(start)
                     f.write(chunk_data)
                 
-                self.log_signal.emit(
-                    f"✅ Chunk {chunk_num}/{total_chunks} completed\n"
-                    f"   Size: {len(chunk_data)//1024//1024} MB"
-                )
                 return len(chunk_data)
                 
             except Exception as e:
                 if attempt == 2:
                     raise Exception(f"Chunk failed after 3 attempts: {str(e)}")
                 
-                self.log_signal.emit(
-                    f"🔄 Retrying chunk {chunk_num} (attempt {attempt+1}/3)\n"
-                    f"   Error: {str(e)}"
-                )
-                time.sleep(1.5 ** attempt)
+                time.sleep(1) # Simple backoff
 
     def process_link(self, link):
         """Safe link processing with error handling"""
         try:
             self.log_signal.emit(f"🔗 Processing: {link[:60]}...")
             
-            # Get file info
-            response = requests.get(link, headers=HEADERS, timeout=30)
+            # Optimization: Use self.session
+            response = self.session.get(link, timeout=30)
             response.raise_for_status()
             
             # Parse content
@@ -340,27 +347,13 @@ class DownloaderWorker(QtCore.QThread):
             self.log_signal.emit(f"❌ Failed: {link}\nError: {str(e)}")
             raise
 
-    def download_file(self, url, path):
-        """Main download handler with thread safety"""
-        try:
-            head = requests.head(url, headers=HEADERS, timeout=10)
-            total_size = int(head.headers.get('content-length', 0))
-            accept_ranges = 'bytes' in head.headers.get('Accept-Ranges', '')
-
-            if total_size > 1024*1024 and accept_ranges:  # Multi-thread for >1MB
-                self.chunked_download(url, path, total_size)
-            else:
-                self.single_thread_download(url, path)
-
-        except requests.RequestException as e:
-            raise Exception(f"Connection error: {str(e)}")
-
     def single_thread_download(self, url, path):
         """Fallback single-thread download"""
         downloaded = 0
         start_time = time.time()
         
-        with requests.get(url, stream=True, timeout=15) as response:
+        # Optimization: Use self.session
+        with self.session.get(url, stream=True, timeout=15) as response:
             response.raise_for_status()
             total_size = int(response.headers.get('content-length', 0))
             
